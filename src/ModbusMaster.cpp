@@ -809,7 +809,7 @@ uint8_t ModbusMaster::ModbusMasterTransaction(uint8_t u8MBFunction)
   }
 
   // verify response is large enough to inspect further
-  if (!u8MBStatus && u8ModbusADUSize >= 5)
+  if (u8MBStatus == ku8MBSuccess && u8ModbusADUSize >= 5)
   {
     // calculate CRC
     u16CRC = 0xFFFF;
@@ -819,8 +819,8 @@ uint8_t ModbusMaster::ModbusMasterTransaction(uint8_t u8MBFunction)
     }
 
     // verify CRC
-    if (u8MBStatus==1 && (lowByte(u16CRC) != u8ModbusADU[u8ModbusADUSize - 2] ||
-                        highByte(u16CRC) != u8ModbusADU[u8ModbusADUSize - 1]))
+    if (lowByte(u16CRC) != u8ModbusADU[u8ModbusADUSize - 2] ||
+        highByte(u16CRC) != u8ModbusADU[u8ModbusADUSize - 1])
     {
       u8MBStatus = ku8MBInvalidCRC;
     }
