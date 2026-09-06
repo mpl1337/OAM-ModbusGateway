@@ -712,7 +712,7 @@ uint8_t ModbusMaster::ModbusMasterTransaction(uint8_t u8MBFunction)
   // loop until we run out of time or bytes, or an error occurs
   u32StartTime = millis();
   // uint8_t u8BytesLeftStore = 0;
-  while (u8BytesLeft && u8MBStatus == 1)
+  while (u8BytesLeft && u8MBStatus == ku8MBSuccess)
   {
     // #if __MODBUSMASTER_DEBUG__
     //     if (u8MBFunction == ku8MBWriteSingleRegister)
@@ -775,7 +775,9 @@ uint8_t ModbusMaster::ModbusMasterTransaction(uint8_t u8MBFunction)
       // check whether Modbus exception occurred; return Modbus Exception Code
       if (bitRead(u8ModbusADU[1], 7))
       {
-        u8MBStatus = u8ModbusADU[2];
+        // Modbus exception 0x01 collides with the internal success status 0x01.
+        // Map Illegal Function to a unique internal error code.
+        u8MBStatus = (u8ModbusADU[2] == 0x01) ? ku8MBIllegalFunction : u8ModbusADU[2];
         break;
       }
 
@@ -827,7 +829,7 @@ uint8_t ModbusMaster::ModbusMasterTransaction(uint8_t u8MBFunction)
   }
 
   // disassemble ADU into words
-  if (u8MBStatus==1)
+  if (u8MBStatus == ku8MBSuccess)
   {
     // evaluate returned Modbus function code
     switch (u8ModbusADU[1])

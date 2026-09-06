@@ -264,7 +264,7 @@ void ModbusModule::loop(bool configured)
                         result = _channels[_channel]->readModbus(true);                                 // read cyclically the Modbus-Channels
                         if (result != result_old[_channel] && _channels[_channel]->getDirection() == 1) // Prüft auf änderung und ob CH ModbusToKnx ist
                         {
-                            if (result == 1)
+                            if (result == ku8MBSuccess)
                             {
                                 logInfoP("CH%i: run again", _channel + 1);
                                 _error[_channel] = false;

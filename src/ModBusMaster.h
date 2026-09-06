@@ -83,9 +83,12 @@ public:
   wrong state to process a request of this type, for example because it is
   unconfigured and is being asked to return register values.
 
+  The Modbus wire exception code 0x01 is mapped internally to 0xE4 because
+  0x01 is used as the transaction success status in this firmware.
+
   @ingroup constant
   */
-  static const uint8_t ku8MBIllegalFunction = 0x00;
+  static const uint8_t ku8MBIllegalFunction = 0xE4;
 
   /**
   Modbus protocol illegal data address exception.
