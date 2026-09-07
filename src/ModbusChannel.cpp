@@ -1,5 +1,6 @@
 #include "ModbusChannel.h"
 #include "Arduino.h"
+#include <cstdio>
 
 #define Serial_Debug_Modbus_Min
 // #define Serial_Debug_Modbus
@@ -138,6 +139,187 @@ bool ModbusChannel::isReadyCH()
 uint8_t ModbusChannel::getModbusID()
 {
     return _modbus_ID;
+}
+
+uint8_t ModbusChannel::getSlaveSelection()
+{
+    return ParamMOD_CHModbusSlaveSelection;
+}
+
+uint8_t ModbusChannel::getDpt()
+{
+    return ParamMOD_CHModBusDptSelection;
+}
+
+uint8_t ModbusChannel::getReadFunction()
+{
+    if (ParamMOD_CHModBusDptSelection == 1 && ParamMOD_CHModBusInputTypDpt1 == 0)
+        return ParamMOD_CHModBusReadBitFunktion;
+    return ParamMOD_CHModBusReadWordFunktion;
+}
+
+uint8_t ModbusChannel::getWriteFunction()
+{
+    if (ParamMOD_CHModBusDptSelection == 1 && ParamMOD_CHModBusInputTypDpt1 == 0)
+        return 0x05; // Write Single Coil
+    if (ParamMOD_CHModBusDptSelection == 12 || ParamMOD_CHModBusDptSelection == 13 || ParamMOD_CHModBusDptSelection == 14)
+        return 0x10; // diese DPTs werden immer über mehrere Register geschrieben
+    return ParamMOD_CHModBusWriteWordFunktion;
+}
+
+uint8_t ModbusChannel::getActiveFunction()
+{
+    return ParamMOD_CHModBusBusDirection == 0 ? getWriteFunction() : getReadFunction();
+}
+
+uint16_t ModbusChannel::getRegisterAddress()
+{
+    return _registerAddr;
+}
+
+uint16_t ModbusChannel::getConfiguredRegisterAddress()
+{
+    return (uint16_t)ParamMOD_CHModbusRegister;
+}
+
+bool ModbusChannel::getCurrentValueText(char *buffer, size_t bufferSize)
+{
+    if (buffer == nullptr || bufferSize == 0)
+        return false;
+
+    buffer[0] = '\0';
+
+    if (!KoMOD_GO_BASE_.initialized())
+    {
+        snprintf(buffer, bufferSize, "noch kein Wert");
+        return false;
+    }
+
+    switch (ParamMOD_CHModBusDptSelection)
+    {
+    case 1:
+        snprintf(buffer, bufferSize, "%s", (bool)KoMOD_GO_BASE_.value(DPT_Switch) ? "1 (Ein)" : "0 (Aus)");
+        break;
+    case 4:
+        snprintf(buffer, bufferSize, "%.1f %%", (double)(float)KoMOD_GO_BASE_.value(DPT_Scaling));
+        break;
+    case 5:
+        snprintf(buffer, bufferSize, "%u", (unsigned int)(uint8_t)KoMOD_GO_BASE_.value(DPT_Value_1_Ucount));
+        break;
+    case 7:
+        snprintf(buffer, bufferSize, "%u", (unsigned int)(uint16_t)KoMOD_GO_BASE_.value(DPT_Value_2_Ucount));
+        break;
+    case 8:
+        snprintf(buffer, bufferSize, "%d", (int)(int16_t)KoMOD_GO_BASE_.value(DPT_Value_2_Count));
+        break;
+    case 9:
+        snprintf(buffer, bufferSize, "%.3f", (double)(float)KoMOD_GO_BASE_.value(DPT_Value_Temp));
+        break;
+    case 12:
+        snprintf(buffer, bufferSize, "%lu", (unsigned long)(uint32_t)KoMOD_GO_BASE_.value(DPT_Value_4_Ucount));
+        break;
+    case 13:
+        snprintf(buffer, bufferSize, "%ld", (long)(int32_t)KoMOD_GO_BASE_.value(DPT_Value_4_Count));
+        break;
+    case 14:
+        snprintf(buffer, bufferSize, "%.3f", (double)(float)KoMOD_GO_BASE_.value(DPT_Value_Acceleration_Angular));
+        break;
+    default:
+        snprintf(buffer, bufferSize, "DPT nicht unterstuetzt");
+        return false;
+    }
+
+    return true;
+}
+
+void ModbusChannel::storeRawModbusBit(bool value)
+{
+    _rawModbusValueValid = true;
+    _rawModbusIsBit = true;
+    _rawModbusBitValue = value;
+    _rawModbusWordCount = 0;
+}
+
+void ModbusChannel::storeRawModbusWords(const uint16_t *words, uint8_t count)
+{
+    if (words == nullptr || count == 0)
+        return;
+
+    if (count > 4)
+        count = 4;
+
+    _rawModbusValueValid = true;
+    _rawModbusIsBit = false;
+    _rawModbusWordCount = count;
+    for (uint8_t i = 0; i < count; i++)
+        _rawModbusWords[i] = words[i];
+    for (uint8_t i = count; i < 4; i++)
+        _rawModbusWords[i] = 0;
+}
+
+void ModbusChannel::captureRawReadValue(uint8_t dpt)
+{
+    if (dpt == 1 && ParamMOD_CHModBusInputTypDpt1 == 0)
+    {
+        storeRawModbusBit(getResponseBuffer(0) != 0);
+        return;
+    }
+
+    uint8_t wordCount = 1;
+    if (dpt == 12)
+    {
+        wordCount = ParamMOD_CHModBusWordTyp12 == 0 ? 1 : (ParamMOD_CHModBusWordTyp12 == 1 ? 2 : 4);
+    }
+    else if (dpt == 13)
+    {
+        wordCount = ParamMOD_CHModBusWordTyp13 == 0 ? 1 : (ParamMOD_CHModBusWordTyp13 == 1 ? 2 : 4);
+    }
+    else if (dpt == 14)
+    {
+        wordCount = ParamMOD_CHModBusWordTyp14 == 0 ? 1 : (ParamMOD_CHModBusWordTyp14 == 1 ? 2 : 4);
+    }
+
+    uint16_t words[4] = {0, 0, 0, 0};
+    for (uint8_t i = 0; i < wordCount; i++)
+        words[i] = getResponseBuffer(i);
+    storeRawModbusWords(words, wordCount);
+}
+
+bool ModbusChannel::getRawModbusValueText(char *buffer, size_t bufferSize)
+{
+    if (buffer == nullptr || bufferSize == 0)
+        return false;
+
+    buffer[0] = '\0';
+    if (!_rawModbusValueValid)
+    {
+        snprintf(buffer, bufferSize, "noch kein Wert");
+        return false;
+    }
+
+    if (_rawModbusIsBit)
+    {
+        snprintf(buffer, bufferSize, "%u", _rawModbusBitValue ? 1U : 0U);
+        return true;
+    }
+
+    if (_rawModbusWordCount == 0)
+        return false;
+
+    size_t used = 0;
+    for (uint8_t i = 0; i < _rawModbusWordCount; i++)
+    {
+        int written = snprintf(buffer + used, bufferSize - used, i == 0 ? "%u" : " / %u", (unsigned int)_rawModbusWords[i]);
+        if (written < 0)
+            break;
+        if ((size_t)written >= bufferSize - used)
+        {
+            buffer[bufferSize - 1] = '\0';
+            break;
+        }
+        used += (size_t)written;
+    }
+    return true;
 }
 
 bool ModbusChannel::getDirection()
@@ -1642,6 +1824,11 @@ uint8_t ModbusChannel::modbusToKnx(uint8_t dpt, bool readRequest)
 
     } // wählt den passenden DPT
 
+    // Cache only data received by the normal channel read. No additional
+    // Modbus transaction is performed for the ETS online table.
+    if (readRequest && result == ku8MBSuccess)
+        captureRawReadValue(dpt);
+
     if (lSend && !errorState[0] && !errorState[1])
     {
         KoMOD_GO_BASE_.objectWritten();
@@ -1689,12 +1876,16 @@ uint8_t ModbusChannel::knxToModbus()
                 SERIAL_DEBUG.print(" 0x05 ");
 #endif
                 result = writeSingleCoil(_registerAddr, v);
+                if (result == ku8MBSuccess)
+                    storeRawModbusBit(v);
             }
             // Bit in Word
             else if (ParamMOD_CHModBusInputTypDpt1 == 1)
             {
                 uint16_t value = v << ParamMOD_CHModBusBitPosDpt1;
                 result = sendProtocol(_registerAddr, value);
+                if (result == ku8MBSuccess)
+                    storeRawModbusWords(&value, 1);
             }
             else
             {
@@ -1710,7 +1901,10 @@ uint8_t ModbusChannel::knxToModbus()
     {
         if (true)
         {
-            result = sendProtocol(_registerAddr, KoMOD_GO_BASE_.value(DPT_Percent_U8));
+            uint16_t v = KoMOD_GO_BASE_.value(DPT_Percent_U8);
+            result = sendProtocol(_registerAddr, v);
+            if (result == ku8MBSuccess)
+                storeRawModbusWords(&v, 1);
             printDebugResult("5.004", _registerAddr, result);
         }
     }
@@ -1743,6 +1937,8 @@ uint8_t ModbusChannel::knxToModbus()
 
         logDebugP("start");
         result = sendProtocol(_registerAddr, v);
+        if (result == ku8MBSuccess)
+            storeRawModbusWords(&v, 1);
         logDebugP("stopp");
         printDebugResult("5.001", _registerAddr, result);
     }
@@ -1769,6 +1965,8 @@ uint8_t ModbusChannel::knxToModbus()
             } // Ende Register Pos
 
             result = sendProtocol(_registerAddr, v);
+            if (result == ku8MBSuccess)
+                storeRawModbusWords(&v, 1);
             printDebugResult("7", _registerAddr, result);
         }
     }
@@ -1779,7 +1977,11 @@ uint8_t ModbusChannel::knxToModbus()
     {
         if (true)
         {
-            result = sendProtocol(_registerAddr, KoMOD_GO_BASE_.value(DPT_Value_2_Count));
+            int16_t knxValue = KoMOD_GO_BASE_.value(DPT_Value_2_Count);
+            uint16_t v = (uint16_t)knxValue;
+            result = sendProtocol(_registerAddr, v);
+            if (result == ku8MBSuccess)
+                storeRawModbusWords(&v, 1);
             printDebugResult("8", _registerAddr, result);
         }
     }
@@ -1817,6 +2019,8 @@ uint8_t ModbusChannel::knxToModbus()
                 return result;
             }
             result = sendProtocol(_registerAddr, v);
+            if (result == ku8MBSuccess)
+                storeRawModbusWords(&v, 1);
             printDebugResult("9", _registerAddr, result);
         }
     }
@@ -1828,9 +2032,12 @@ uint8_t ModbusChannel::knxToModbus()
         if (true)
         {
             uint32_t v = KoMOD_GO_BASE_.value(DPT_Value_4_Ucount);
-            setTransmitBuffer(0, v >> 16);
-            setTransmitBuffer(1, v & 0xffff);
+            uint16_t words[2] = {(uint16_t)(v >> 16), (uint16_t)(v & 0xffff)};
+            setTransmitBuffer(0, words[0]);
+            setTransmitBuffer(1, words[1]);
             result = writeMultipleRegisters(_registerAddr, 2);
+            if (result == ku8MBSuccess)
+                storeRawModbusWords(words, 2);
             printDebugResult("12 0x10", _registerAddr, result);
         }
     }
@@ -1842,9 +2049,12 @@ uint8_t ModbusChannel::knxToModbus()
         if (true)
         {
             int32_t v = KoMOD_GO_BASE_.value(DPT_Value_4_Count);
-            setTransmitBuffer(0, v >> 16);
-            setTransmitBuffer(1, v);
+            uint16_t words[2] = {(uint16_t)(((uint32_t)v) >> 16), (uint16_t)v};
+            setTransmitBuffer(0, words[0]);
+            setTransmitBuffer(1, words[1]);
             result = writeMultipleRegisters(_registerAddr, 2);
+            if (result == ku8MBSuccess)
+                storeRawModbusWords(words, 2);
             printDebugResult("13 0x10", _registerAddr, result);
         }
     }
@@ -1862,18 +2072,23 @@ uint8_t ModbusChannel::knxToModbus()
                 uint32_t intVal;
             };
             uint32_t v = ((floatint *)&raw)->intVal;
+            uint16_t words[2];
             // HI / LO   OR   LO / Hi  order
             if (ParamMOD_CHModBusWordPosDpt14 == 0)
             { // HI / LO
-                setTransmitBuffer(0, v >> 16);
-                setTransmitBuffer(1, v);
+                words[0] = (uint16_t)(v >> 16);
+                words[1] = (uint16_t)v;
             }
             else
             { // LO / HI
-                setTransmitBuffer(0, v);
-                setTransmitBuffer(1, v >> 16);
+                words[0] = (uint16_t)v;
+                words[1] = (uint16_t)(v >> 16);
             }
+            setTransmitBuffer(0, words[0]);
+            setTransmitBuffer(1, words[1]);
             result = writeMultipleRegisters(_registerAddr, 2);
+            if (result == ku8MBSuccess)
+                storeRawModbusWords(words, 2);
             printDebugResult("14 0x10", _registerAddr, result);
         }
     }

@@ -3,6 +3,7 @@
 #include "ModBusMaster.h"
 #include "LED_Statusanzeige.h"
 #include "Device.h"
+#include <cstring>
 
 
 // uint32_t timer_time_between_Reg_Reads;
@@ -13,6 +14,20 @@ bool readyToSend = false;
 
 bool ModbusModule::idle_processing = false;
 unsigned long ModbusModule::_timerCycleChannel = 0;
+
+static void modbusPutWord(uint8_t *data, uint8_t &pos, uint16_t value)
+{
+    data[pos++] = (value >> 8) & 0xFF;
+    data[pos++] = value & 0xFF;
+}
+
+static void modbusPutDWord(uint8_t *data, uint8_t &pos, uint32_t value)
+{
+    data[pos++] = (value >> 24) & 0xFF;
+    data[pos++] = (value >> 16) & 0xFF;
+    data[pos++] = (value >> 8) & 0xFF;
+    data[pos++] = value & 0xFF;
+}
 
 ModbusModule::ModbusModule()
 {
@@ -208,6 +223,312 @@ void ModbusModule::ErrorHandlingLED()
     }
 }
 
+uint8_t ModbusModule::activeErrorCount()
+{
+    uint8_t count = 0;
+    uint8_t visible = ParamMOD_VisibleChannels;
+    if (visible > MOD_ChannelCount)
+        visible = MOD_ChannelCount;
+
+    for (uint8_t i = 0; i < visible; i++)
+    {
+        if (_error[i])
+            count++;
+    }
+    return count;
+}
+
+void ModbusModule::clearErrorLog()
+{
+    memset(_errorLog, 0, sizeof(_errorLog));
+    _errorLogNext = 0;
+    _errorLogCount = 0;
+    _errorLogSequence = 0;
+    _errorEventCounter = 0;
+}
+
+bool ModbusModule::getErrorLogEntryByDisplayIndex(uint8_t displayIndex, ModbusErrorLogEntry &entry)
+{
+    if (displayIndex >= _errorLogCount)
+        return false;
+
+    int16_t physicalIndex = (int16_t)_errorLogNext - 1 - displayIndex;
+    while (physicalIndex < 0)
+        physicalIndex += MODBUS_ERRORLOG_SIZE;
+
+    entry = _errorLog[physicalIndex % MODBUS_ERRORLOG_SIZE];
+    return true;
+}
+
+void ModbusModule::updateErrorLogTimestamp(ModbusErrorLogEntry &entry)
+{
+    entry.uptimeSeconds = millis() / 1000;
+    entry.year = 0;
+    entry.month = 0;
+    entry.day = 0;
+    entry.hour = 0;
+    entry.minute = 0;
+    entry.second = 0;
+
+    // Wenn die OpenKNX-Zeit bereits über KNX gesetzt wurde, wird sie zusätzlich
+    // im Fehlerlog gespeichert. Ohne gültige KNX-Zeit bleibt nur die Laufzeit.
+    if (openknx.time.isValid())
+    {
+        OpenKNX::DateTime now = openknx.time.getLocalTime();
+        entry.year = now.year;
+        entry.month = now.month;
+        entry.day = now.day;
+        entry.hour = now.hour;
+        entry.minute = now.minute;
+        entry.second = now.second;
+    }
+}
+
+void ModbusModule::addErrorLogEntry(uint8_t channelIndex, uint8_t result, bool recovered)
+{
+    if (channelIndex >= ParamMOD_VisibleChannels || _channels[channelIndex] == nullptr)
+        return;
+
+    const uint8_t flags = recovered ? 0x01 : 0x00;
+    const uint8_t channel = channelIndex + 1;
+
+    // Nicht nur den physisch letzten Logeintrag prüfen. Bei mehreren dauerhaft
+    // fehlerhaften Kanälen wechseln sich die Meldungen ab. Deshalb wird der
+    // jeweils letzte Zustand dieses Kanals gesucht. Ist er unverändert, wird
+    // lediglich der Wiederholungszähler und der Zeitstempel aktualisiert.
+    for (uint8_t displayIndex = 0; displayIndex < _errorLogCount; displayIndex++)
+    {
+        int16_t physicalIndex = (int16_t)_errorLogNext - 1 - displayIndex;
+        while (physicalIndex < 0)
+            physicalIndex += MODBUS_ERRORLOG_SIZE;
+
+        ModbusErrorLogEntry &lastForChannel = _errorLog[physicalIndex % MODBUS_ERRORLOG_SIZE];
+        if (lastForChannel.channel != channel)
+            continue;
+
+        if (lastForChannel.errorCode == result &&
+            lastForChannel.flags == flags)
+        {
+            if (lastForChannel.repeats < 0xFFFF)
+                lastForChannel.repeats++;
+            updateErrorLogTimestamp(lastForChannel);
+            return;
+        }
+
+        // Der letzte Eintrag dieses Kanals beschreibt einen anderen Zustand.
+        // Ältere Einträge desselben Kanals dürfen daher nicht zusammengefasst werden.
+        break;
+    }
+
+    ModbusErrorLogEntry &entry = _errorLog[_errorLogNext];
+    memset(&entry, 0, sizeof(entry));
+    updateErrorLogTimestamp(entry);
+    entry.repeats = 1;
+    entry.sequence = ++_errorLogSequence;
+    entry.channel = channel;
+    entry.slaveId = _channels[channelIndex]->getModbusID();
+    entry.errorCode = result;
+    entry.functionCode = _channels[channelIndex]->getActiveFunction();
+    entry.dpt = _channels[channelIndex]->getDpt();
+    entry.registerAddress = _channels[channelIndex]->getRegisterAddress();
+    entry.flags = flags;
+
+    _errorLogNext = (_errorLogNext + 1) % MODBUS_ERRORLOG_SIZE;
+    if (_errorLogCount < MODBUS_ERRORLOG_SIZE)
+        _errorLogCount++;
+
+    if (!recovered && _errorEventCounter < 0xFFFF)
+        _errorEventCounter++;
+}
+
+void ModbusModule::handleChannelResult(uint8_t channelIndex, uint8_t result)
+{
+    if (channelIndex >= ParamMOD_VisibleChannels || _channels[channelIndex] == nullptr)
+        return;
+
+    if (_channels[channelIndex]->getDirection() != 1)
+        return;
+
+    if (result == result_old[channelIndex])
+    {
+        if (result != ku8MBSuccess)
+            addErrorLogEntry(channelIndex, result, false);
+        return;
+    }
+
+    if (result == ku8MBSuccess)
+    {
+        logInfoP("CH%i: run again", channelIndex + 1);
+        if (_error[channelIndex])
+            addErrorLogEntry(channelIndex, result, true);
+        _error[channelIndex] = false;
+    }
+    else
+    {
+        logInfoP("CH%i: ERROR: %02X", channelIndex + 1, result);
+        _error[channelIndex] = true;
+        addErrorLogEntry(channelIndex, result, false);
+    }
+
+    uint16_t diag_register = ((uint16_t)result << 8) | (channelIndex + 1);
+    KoMOD_DebugModbus.value(diag_register, DPT_Value_2_Ucount);
+    result_old[channelIndex] = result;
+}
+
+void ModbusModule::fillErrorLogSummary(uint8_t *resultData, uint8_t &resultLength)
+{
+    uint8_t pos = 0;
+    resultData[pos++] = 0;
+    resultData[pos++] = _errorLogCount;
+    resultData[pos++] = activeErrorCount();
+    modbusPutWord(resultData, pos, _errorEventCounter);
+    resultData[pos++] = ParamMOD_VisibleChannels;
+    modbusPutDWord(resultData, pos, millis() / 1000);
+    resultLength = pos;
+}
+
+void ModbusModule::fillErrorLogEntry(uint8_t displayIndex, uint8_t *resultData, uint8_t &resultLength)
+{
+    ModbusErrorLogEntry entry;
+    if (!getErrorLogEntryByDisplayIndex(displayIndex, entry))
+    {
+        resultData[0] = 2;
+        resultData[1] = 0;
+        resultLength = 2;
+        return;
+    }
+
+    uint8_t pos = 0;
+    resultData[pos++] = 0;
+    resultData[pos++] = entry.sequence;
+    resultData[pos++] = entry.channel;
+    resultData[pos++] = entry.slaveId;
+    resultData[pos++] = entry.errorCode;
+    resultData[pos++] = entry.functionCode;
+    resultData[pos++] = entry.dpt;
+    modbusPutWord(resultData, pos, entry.registerAddress);
+    modbusPutWord(resultData, pos, entry.repeats);
+    modbusPutDWord(resultData, pos, entry.uptimeSeconds);
+    resultData[pos++] = entry.flags;
+    modbusPutWord(resultData, pos, entry.year);
+    resultData[pos++] = entry.month;
+    resultData[pos++] = entry.day;
+    resultData[pos++] = entry.hour;
+    resultData[pos++] = entry.minute;
+    resultData[pos++] = entry.second;
+    resultLength = pos;
+}
+
+uint8_t ModbusModule::activeRegisterCount()
+{
+    uint8_t count = 0;
+    for (uint16_t i = 0; i < ParamMOD_VisibleChannels; i++)
+    {
+        if (_channels[i] != nullptr && _channels[i]->isActiveCH())
+            count++;
+    }
+    return count;
+}
+
+int16_t ModbusModule::channelIndexByActiveRegister(uint8_t displayIndex)
+{
+    uint8_t activeIndex = 0;
+    for (uint16_t i = 0; i < ParamMOD_VisibleChannels; i++)
+    {
+        if (_channels[i] == nullptr || !_channels[i]->isActiveCH())
+            continue;
+        if (activeIndex == displayIndex)
+            return (int16_t)i;
+        activeIndex++;
+    }
+    return -1;
+}
+
+void ModbusModule::fillRegisterTableSummary(uint8_t *resultData, uint8_t &resultLength)
+{
+    uint8_t pos = 0;
+    resultData[pos++] = 0;
+    resultData[pos++] = activeRegisterCount();
+    resultData[pos++] = ParamMOD_VisibleChannels;
+    modbusPutDWord(resultData, pos, millis() / 1000);
+    resultLength = pos;
+}
+
+void ModbusModule::fillRegisterTableEntry(uint8_t displayIndex, uint8_t *resultData, uint8_t &resultLength)
+{
+    int16_t channelIndex = channelIndexByActiveRegister(displayIndex);
+    if (channelIndex < 0 || _channels[channelIndex] == nullptr)
+    {
+        resultData[0] = 2;
+        resultData[1] = 0;
+        resultLength = 2;
+        return;
+    }
+
+    ModbusChannel *channel = _channels[channelIndex];
+    char rawModbusText[80];
+    char knxValueText[80];
+    bool rawAvailable = channel->getRawModbusValueText(rawModbusText, sizeof(rawModbusText));
+    bool knxAvailable = channel->getCurrentValueText(knxValueText, sizeof(knxValueText));
+
+    uint8_t pos = 0;
+    resultData[pos++] = 0;
+    resultData[pos++] = (uint8_t)(channelIndex + 1);
+    resultData[pos++] = channel->getSlaveSelection();
+    resultData[pos++] = channel->getModbusID();
+    resultData[pos++] = channel->getActiveFunction();
+    resultData[pos++] = channel->getDpt();
+    resultData[pos++] = channel->getDirection() ? 1 : 0;
+    modbusPutWord(resultData, pos, channel->getConfiguredRegisterAddress());
+
+    uint8_t flags = 0;
+    if (rawAvailable)
+        flags |= 0x01;
+    if (channel->getDirection() == 1 && _error[channelIndex])
+        flags |= 0x02;
+    if (knxAvailable)
+        flags |= 0x04;
+    resultData[pos++] = flags;
+    resultData[pos++] = (channel->getDirection() == 1) ? result_old[channelIndex] : 0xFF;
+
+    size_t rawLength = rawAvailable ? strlen(rawModbusText) : 0;
+    size_t knxLength = knxAvailable ? strlen(knxValueText) : 0;
+    if (rawLength > sizeof(rawModbusText) - 1)
+        rawLength = sizeof(rawModbusText) - 1;
+    if (knxLength > sizeof(knxValueText) - 1)
+        knxLength = sizeof(knxValueText) - 1;
+
+    // Two lengths are sent before the two strings. Keep the complete response
+    // below the KNX function-property payload limit.
+    size_t maxTextBytes = 240 - (pos + 2);
+    if (rawLength + knxLength > maxTextBytes)
+    {
+        if (rawLength > maxTextBytes)
+        {
+            rawLength = maxTextBytes;
+            knxLength = 0;
+        }
+        else
+        {
+            knxLength = maxTextBytes - rawLength;
+        }
+    }
+
+    resultData[pos++] = (uint8_t)rawLength;
+    resultData[pos++] = (uint8_t)knxLength;
+    if (rawLength > 0)
+    {
+        memcpy(resultData + pos, rawModbusText, rawLength);
+        pos += (uint8_t)rawLength;
+    }
+    if (knxLength > 0)
+    {
+        memcpy(resultData + pos, knxValueText, knxLength);
+        pos += (uint8_t)knxLength;
+    }
+    resultLength = pos;
+}
+
 void ModbusModule::loop(bool configured)
 {
 
@@ -226,7 +547,6 @@ void ModbusModule::loop(bool configured)
         uint8_t processed = 0;
         uint8_t count = 0;
         uint8_t result;
-        uint16_t diag_register = 0;
         do
         {
             errorHandling();
@@ -261,24 +581,8 @@ void ModbusModule::loop(bool configured)
                     }
                     else if (run_cycle) // MODBUS to KNX Abfrage
                     {
-                        result = _channels[_channel]->readModbus(true);                                 // read cyclically the Modbus-Channels
-                        if (result != result_old[_channel] && _channels[_channel]->getDirection() == 1) // Prüft auf änderung und ob CH ModbusToKnx ist
-                        {
-                            if (result == ku8MBSuccess)
-                            {
-                                logInfoP("CH%i: run again", _channel + 1);
-                                _error[_channel] = false;
-                            }
-                            else
-                            {
-                                logInfoP("CH%i: ERROR: %i", _channel + 1, result, HEX);
-                                _error[_channel] = true;
-                            }
-                            // Diagnose Objekt schicken
-                            diag_register = ((uint16_t)result << 8) | (_channel + 1); // Setzt aktuellen CH auf LSB & Error Code auf MSB
-                            KoMOD_DebugModbus.value(diag_register, DPT_Value_2_Ucount);
-                            result_old[_channel] = result;
-                        }
+                        result = _channels[_channel]->readModbus(true); // read cyclically the Modbus-Channels
+                        handleChannelResult(_channel, result);
 
                         // Sucht nächsten aktiven und wartenden Channel
                         _channel = findNextReady(ParamMOD_VisibleChannels, _channel);
@@ -345,23 +649,105 @@ void ModbusModule::processInputKo(GroupObject &ko)
 
 void ModbusModule::showHelp()
 {
-    openknx.console.printHelpLine("modbus", "Print a modbus text");
+    openknx.console.printHelpLine("modbus", "Print the Modbus error log");
+    openknx.console.printHelpLine("modbus log", "Print the Modbus error log");
+    openknx.console.printHelpLine("modbus log clear", "Clear the Modbus error log");
+}
+
+bool ModbusModule::processFunctionProperty(uint8_t objectIndex, uint8_t propertyId, uint8_t length, uint8_t *data, uint8_t *resultData, uint8_t &resultLength)
+{
+    if (objectIndex != MODBUS_ERRORLOG_OBJECT_INDEX || propertyId != MODBUS_ERRORLOG_PROPERTY_ID)
+        return false;
+
+    openknx.common.skipLooptimeWarning();
+
+    if (length < 1)
+    {
+        resultData[0] = 1;
+        resultData[1] = 0;
+        resultLength = 2;
+        return true;
+    }
+
+    switch (data[0])
+    {
+    case 1: // summary
+        fillErrorLogSummary(resultData, resultLength);
+        return true;
+
+    case 2: // entry by display index, 0 = newest
+        if (length < 2)
+        {
+            resultData[0] = 1;
+            resultData[1] = 0;
+            resultLength = 2;
+            return true;
+        }
+        fillErrorLogEntry(data[1], resultData, resultLength);
+        return true;
+
+    case 3: // clear log
+        clearErrorLog();
+        resultData[0] = 0;
+        resultData[1] = 0;
+        resultLength = 2;
+        return true;
+
+    case 4: // configured Modbus register table summary
+        fillRegisterTableSummary(resultData, resultLength);
+        return true;
+
+    case 5: // configured Modbus register table entry
+        if (length < 2)
+        {
+            resultData[0] = 1;
+            resultData[1] = 0;
+            resultLength = 2;
+            return true;
+        }
+        fillRegisterTableEntry(data[1], resultData, resultLength);
+        return true;
+
+    default:
+        resultData[0] = 1;
+        resultData[1] = 0;
+        resultLength = 2;
+        return true;
+    }
 }
 
 bool ModbusModule::processCommand(const std::string cmd, bool diagnoseKo)
 {
-    if (cmd.substr(0, 5) == "modbus")
+    if (cmd == "modbus" || cmd == "modbus log")
     {
-        logInfoP("modbus Info");
+        logInfoP("Modbus Fehlerlog: Eintraege=%u, aktive Fehler=%u, Ereignisse=%u", _errorLogCount, activeErrorCount(), _errorEventCounter);
         logIndentUp();
-        logInfoP("Info 1");
-        logInfoP("Info 2");
-        logIndentUp();
-        logInfoP("Info 2a");
-        logInfoP("Info 2b");
+        for (uint8_t i = 0; i < _errorLogCount; i++)
+        {
+            ModbusErrorLogEntry entry;
+            if (getErrorLogEntryByDisplayIndex(i, entry))
+            {
+                logInfoP("#%u CH%u Slave%u Err=0x%02X Fn=0x%02X DPT=%u Reg=%u Rep=%u t=%lus%s",
+                         entry.sequence,
+                         entry.channel,
+                         entry.slaveId,
+                         entry.errorCode,
+                         entry.functionCode,
+                         entry.dpt,
+                         entry.registerAddress,
+                         entry.repeats,
+                         entry.uptimeSeconds,
+                         (entry.flags & 0x01) ? " RECOVERY" : "");
+            }
+        }
         logIndentDown();
-        logInfoP("Info 3");
-        logIndentDown();
+        return true;
+    }
+
+    if (cmd == "modbus log clear")
+    {
+        clearErrorLog();
+        logInfoP("Modbus Fehlerlog geloescht");
         return true;
     }
 

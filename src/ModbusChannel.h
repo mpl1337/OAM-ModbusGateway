@@ -1,4 +1,6 @@
 #pragma once
+
+#include <cstddef>
 #include "OpenKNX.h"
 #include "ModBusMaster.h"
 
@@ -20,6 +22,14 @@ private:
   bool _readyToSend;
   uint8_t _skipCounter;
 
+  // Last raw value successfully transferred on Modbus. The ETS online table
+  // uses this cache and therefore never triggers an additional Modbus request.
+  bool _rawModbusValueValid = false;
+  bool _rawModbusIsBit = false;
+  bool _rawModbusBitValue = false;
+  uint8_t _rawModbusWordCount = 0;
+  uint16_t _rawModbusWords[4] = {0, 0, 0, 0};
+
   typedef union Values
   {
     uint8_t lValueUint8_t;
@@ -36,6 +46,9 @@ private:
   bool modbusParitySerial(uint32_t baud, HardwareSerial &serial);
   bool modbusInitSerial(HardwareSerial &serial);
   void sendKNX();
+  void storeRawModbusBit(bool value);
+  void storeRawModbusWords(const uint16_t *words, uint8_t count);
+  void captureRawReadValue(uint8_t dpt);
 
 public:
   ModbusChannel(uint8_t index, uint8_t baud_value, uint8_t parity_value, HardwareSerial &serial);
@@ -43,6 +56,15 @@ public:
   bool readDone();
   bool isReadyCH();
   uint8_t getModbusID();
+  uint8_t getSlaveSelection();
+  uint8_t getDpt();
+  uint8_t getReadFunction();
+  uint8_t getWriteFunction();
+  uint8_t getActiveFunction();
+  uint16_t getRegisterAddress();
+  uint16_t getConfiguredRegisterAddress();
+  bool getCurrentValueText(char *buffer, size_t bufferSize);
+  bool getRawModbusValueText(char *buffer, size_t bufferSize);
   bool getDirection();
   inline uint16_t adjustRegisterAddress(uint16_t u16ReadAddress, uint8_t RegisterStart);
   uint8_t readModbus(bool readyToSend);
